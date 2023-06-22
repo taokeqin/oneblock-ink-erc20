@@ -24,9 +24,9 @@ mod erc20 {
     #[ink(event)]
     pub struct Transfer {
         #[ink(topic)]
-        from: AccountId,
+        from: Option<AccountId>,
         #[ink(topic)]
-        to: AccountId,
+        to: Option<AccountId>,
         #[ink(topic)]
         value: Balance,
     }
@@ -47,6 +47,11 @@ mod erc20 {
         pub fn new(total_supply: Balance) -> Self {
             let mut balances = Mapping::new();
             balances.insert(Self::env().caller(), &total_supply);
+            Self::env().emit_event(Transfer {
+                from: None,
+                to: Some(Self::env().caller()),
+                value: total_supply,
+            });
             Self {
                 total_supply,
                 balances,
@@ -80,7 +85,11 @@ mod erc20 {
             self.balances.insert(from, &(balance_from - value));
             self.balances.insert(to, &(balance_to + value));
 
-            self.env().emit_event(Transfer { from, to, value });
+            self.env().emit_event(Transfer {
+                from: Some(from),
+                to: Some(to),
+                value,
+            });
             Ok(())
         }
 
@@ -124,99 +133,97 @@ mod erc20 {
         }
     }
 
-    /// Unit tests in Rust are normally defined within such a `#[cfg(test)]`
-    /// module and test functions are marked with a `#[test]` attribute.
-    /// The below code is technically just normal Rust code.
+    type Event = <Erc20 as ::ink::reflect::ContractEventBase>::Type;
     #[cfg(test)]
     mod tests {
-        /// Imports all the definitions from the outer scope so we can use them here.
         use super::*;
 
-        /// We test if the default constructor does its job.
         #[ink::test]
-        fn default_works() {
-            let erc20 = Erc20::default();
-            assert_eq!(erc20.get(), false);
+        fn constructor_works() {
+            let erc20 = Erc20::new(123);
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            assert_eq!(erc20.total_supply, 123);
+            assert_eq!(erc20.balance_of(accounts.alice), 123);
+
+            let emitted_events = ink::env::test::recorded_events().collect::<Vec<_>>();
+            let first_event = emitted_events.get(0).expect("No event found");
+
+            let decoded = <Event as scale::Decode>::decode(&mut &first_event.data[..])
+                .expect("Could not decode event data");
+            match decoded {
+                Event::Transfer(Transfer { from, to, value }) => {
+                    assert_eq!(from, None);
+                    assert_eq!(to, Some(accounts.alice));
+                    assert_eq!(value, 123);
+                }
+                _ => panic!("No transfer event emitted!"),
+            }
         }
 
-        /// We test a simple use case of our contract.
+        // test transfer
         #[ink::test]
-        fn it_works() {
-            let mut erc20 = Erc20::new(false);
-            assert_eq!(erc20.get(), false);
-            erc20.flip();
-            assert_eq!(erc20.get(), true);
+        fn transfer_works() {
+            let mut erc20 = Erc20::new(1000);
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            assert_eq!(erc20.balance_of(accounts.alice), 1000);
+            assert_eq!(erc20.balance_of(accounts.bob), 0);
+
+            assert_eq!(erc20.transfer(accounts.bob, 100), Ok(()));
+            assert_eq!(erc20.balance_of(accounts.alice), 900);
+            assert_eq!(erc20.balance_of(accounts.bob), 100);
+        }
+
+        // test transfer with low balance
+        #[ink::test]
+        fn transfer_with_low_balance_show_fail() {
+            let mut erc20 = Erc20::new(1000);
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            assert_eq!(erc20.balance_of(accounts.alice), 1000);
+            assert_eq!(erc20.balance_of(accounts.bob), 0);
+
+            assert_eq!(
+                erc20.transfer(accounts.bob, 1001),
+                Err(Error::BalanceTooLow)
+            );
+            assert_eq!(erc20.balance_of(accounts.alice), 1000);
+            assert_eq!(erc20.balance_of(accounts.bob), 0);
         }
     }
 
-    /// This is how you'd write end-to-end (E2E) or integration tests for ink! contracts.
-    ///
-    /// When running these you need to make sure that you:
-    /// - Compile the tests with the `e2e-tests` feature flag enabled (`--features e2e-tests`)
-    /// - Are running a Substrate node which contains `pallet-contracts` in the background
     #[cfg(all(test, feature = "e2e-tests"))]
     mod e2e_tests {
-        /// Imports all the definitions from the outer scope so we can use them here.
         use super::*;
-
-        /// A helper function used for calling contract messages.
         use ink_e2e::build_message;
-
-        /// The End-to-End test `Result` type.
         type E2EResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-        /// We test that we can upload and instantiate the contract using its default constructor.
+        // test transfer
         #[ink_e2e::test]
-        async fn default_works(mut client: ink_e2e::Client<C, E>) -> E2EResult<()> {
+        async fn e2e_transfer(mut client: ink_e2e::Client<C, E>) -> E2EResult<()> {
             // Given
-            let constructor = Erc20Ref::default();
-
-            // When
+            let constructor = Erc20Ref::new(1000);
             let contract_account_id = client
                 .instantiate("erc20", &ink_e2e::alice(), constructor, 0, None)
                 .await
                 .expect("instantiate failed")
                 .account_id;
 
-            // Then
-            let get =
-                build_message::<Erc20Ref>(contract_account_id.clone()).call(|erc20| erc20.get());
-            let get_result = client.call_dry_run(&ink_e2e::alice(), &get, 0, None).await;
-            assert!(matches!(get_result.return_value(), false));
+            let alice_acc = ink_e2e::account_id(ink_e2e::AccountKeyring::Alice);
+            let bob_acc = ink_e2e::account_id(ink_e2e::AccountKeyring::Bob);
 
-            Ok(())
-        }
+            // test transfer
+            let transfer_msg = build_message::<Erc20Ref>(contract_account_id.clone())
+                .call(|erc20| erc20.transfer(bob_acc.clone(), 100));
+            let transfer_result = client.call(&ink_e2e::alice(), transfer_msg, 0, None).await;
+            assert!(transfer_result.is_ok());
 
-        /// We test that we can read and write a value from the on-chain contract contract.
-        #[ink_e2e::test]
-        async fn it_works(mut client: ink_e2e::Client<C, E>) -> E2EResult<()> {
-            // Given
-            let constructor = Erc20Ref::new(false);
-            let contract_account_id = client
-                .instantiate("erc20", &ink_e2e::bob(), constructor, 0, None)
-                .await
-                .expect("instantiate failed")
-                .account_id;
+            // check status after transfer
+            let balance_of_msg = build_message::<Erc20Ref>(contract_account_id.clone())
+                .call(|erc20| erc20.balance_of(alice_acc.clone()));
+            let balance_of_result = client
+                .call_dry_run(&ink_e2e::alice(), &balance_of_msg, 0, None)
+                .await;
 
-            let get =
-                build_message::<Erc20Ref>(contract_account_id.clone()).call(|erc20| erc20.get());
-            let get_result = client.call_dry_run(&ink_e2e::bob(), &get, 0, None).await;
-            assert!(matches!(get_result.return_value(), false));
-
-            // When
-            let flip =
-                build_message::<Erc20Ref>(contract_account_id.clone()).call(|erc20| erc20.flip());
-            let _flip_result = client
-                .call(&ink_e2e::bob(), flip, 0, None)
-                .await
-                .expect("flip failed");
-
-            // Then
-            let get =
-                build_message::<Erc20Ref>(contract_account_id.clone()).call(|erc20| erc20.get());
-            let get_result = client.call_dry_run(&ink_e2e::bob(), &get, 0, None).await;
-            assert!(matches!(get_result.return_value(), true));
-
+            assert_eq!(balance_of_result.return_value(), 900);
             Ok(())
         }
     }
